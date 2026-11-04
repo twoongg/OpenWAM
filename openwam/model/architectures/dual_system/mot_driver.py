@@ -28,10 +28,12 @@ from openwam.model.architectures.utils.mask_modes import (
     validate_attention_mask_mode,
     widen_mask_for_prefix_kv,
 )
+from openwam.model.ttt import add_ttt_residual
 
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
     from openwam.model.architectures.base import ActionState
+    from openwam.model.ttt import VideoTTTMemory
     from openwam.model.video_backbone.base import BlockLoopState, VideoBackbone
 
 
@@ -65,6 +67,7 @@ class DualSystemMoTDriver:
         mot_checkpoint_mixed_attn: bool = True,
         attention_mask_mode: str = ACTION_SEES_VIDEO,
         video_attention_mask_mode: Optional[str] = None,
+        ttt: Optional["VideoTTTMemory"] = None,
     ) -> None:
         if vb.num_layers != ab.num_layers:
             raise ValueError(
@@ -90,6 +93,10 @@ class DualSystemMoTDriver:
         self.head_dim = vb.head_dim
         self.mot_checkpoint_mixed_attn = bool(mot_checkpoint_mixed_attn)
         self.attention_mask_mode = attention_mask_mode
+        # Optional video-expert TTT memory (owned by the architecture). Its
+        # residual is added after each layer's step, outside any activation
+        # checkpoint, so memory writes never re-run on the backward recompute.
+        self.ttt = ttt
 
         # Allow the architecture / config to override the video v↔v sub-mode.
         # When None we defer to whatever ``vb.video_attention_mask_mode`` reports.
@@ -182,11 +189,14 @@ class DualSystemMoTDriver:
         to avoid nested-checkpoint waste — the outer wrapper already
         recomputes mixed attention.
         """
+        z_in = vstate.hidden_states
         if use_gradient_checkpointing and self.ab.training:
-            return self._step_checkpointed(
+            vstate, astate = self._step_checkpointed(
                 layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
             )
-        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
+        else:
+            vstate, astate = self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
+        return add_ttt_residual(self.ttt, layer_id, z_in, vstate), astate
 
     def _step_impl(
         self,

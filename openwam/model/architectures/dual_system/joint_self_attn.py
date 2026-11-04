@@ -30,6 +30,7 @@ from openwam.model.compile_options import (
     self_attn_compile_cfg,
     torch_compile_kwargs,
 )
+from openwam.model.ttt import VideoTTTMemory, add_ttt_residual
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         self._mot_driver: DualSystemMoTDriver | None = None
         self._mot_driver_kwargs: dict = {}
         self._compiled_mot_run_joint_loop: Optional[Callable[..., Tuple[object, object]]] = None
+        self.video_ttt: VideoTTTMemory | None = None
         if cfg is None:
             return
         if self.video_backbone is not None:
@@ -86,6 +88,7 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             text_dim=text_dim,
             shift_action=cfg.get("shift_action"),
         )
+        self.video_ttt = self._build_video_ttt(cfg, video_dim=video_dim, num_layers=len(bl))
 
         # MoT driver is built once both backbones are available. The video
         # backbone is normally constructed in ``BaseWAMArchitecture._init_video_backbone``
@@ -122,9 +125,47 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         self._mot_driver = DualSystemMoTDriver(
             self.video_backbone,
             self.action_backbone,
+            ttt=self.video_ttt,
             **self._mot_driver_kwargs,
         )
         return self._mot_driver
+
+    def _build_video_ttt(self, cfg, *, video_dim: int, num_layers: int) -> VideoTTTMemory | None:
+        """Build the video-expert TTT memory from ``cfg.ttt`` (None when absent / disabled)."""
+        ttt_cfg = self._cfg_get(cfg, "ttt", None)
+        if not ttt_cfg or not bool(self._cfg_get(ttt_cfg, "enabled", False)):
+            return None
+        layers = self._cfg_get(ttt_cfg, "layers", None)
+        layers = list(range(num_layers)) if layers is None else [int(layer) for layer in layers]
+        bad = [layer for layer in layers if not 0 <= layer < num_layers]
+        if bad:
+            raise ValueError(f"ttt.layers {bad} out of range for a {num_layers}-layer video backbone")
+        memory = VideoTTTMemory(
+            dim=video_dim,
+            layers=layers,
+            num_heads=int(self._cfg_get(ttt_cfg, "num_heads", 8)),
+            head_dim=int(self._cfg_get(ttt_cfg, "head_dim", 64)),
+            hidden_dim=int(self._cfg_get(ttt_cfg, "hidden_dim", 128)),
+            weight_norm=bool(self._cfg_get(ttt_cfg, "weight_norm", True)),
+        )
+        logger.info("Video TTT memory on layers %s", list(memory.layers))
+        return memory
+
+    def _optional_checkpoint_prefixes(self) -> tuple[str, ...]:
+        # Benchmark-finetuned checkpoints predate the TTT memory; it starts zero-initialised.
+        return ("video_ttt.",) if self.video_ttt is not None else ()
+
+    def restrict_training_to_ttt(self) -> None:
+        """Make the TTT slow weights the only trainable parameters (TTT meta-training).
+
+        Unlike ``freeze_modules`` this only flips ``requires_grad``: it must not wrap
+        the backbones in ``no_grad``, because the target loss reaches earlier TTT
+        layers by back-propagating through the frozen video / action experts.
+        """
+        if self.video_ttt is None:
+            raise RuntimeError("restrict_training_to_ttt: ttt is not enabled for this architecture")
+        for name, param in self.named_parameters():
+            param.requires_grad_(name.startswith("video_ttt."))
 
     @property
     def mot_driver(self) -> DualSystemMoTDriver | None:
@@ -210,7 +251,9 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
 
         if noisy_actions is None or ab is None:
             for block_id in range(vb.num_layers):
+                z_in = vstate.hidden_states
                 vstate = vb.run_block(block_id, vstate)
+                vstate = add_ttt_residual(self.video_ttt, block_id, z_in, vstate)
             return vb.finalize(vstate), None
 
         driver = self._mot_driver
@@ -226,6 +269,10 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
         compiled_loop = getattr(self, "_compiled_mot_run_joint_loop", None)
+        if self.video_ttt is not None:
+            # Fast-weight state changes between calls (and writes run autograd);
+            # keep the TTT path eager rather than re-tracing on every update.
+            compiled_loop = None
         if compiled_loop is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
             try:
                 vstate, astate = compiled_loop(vstate, astate)

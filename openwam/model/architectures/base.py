@@ -676,6 +676,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
+    def _optional_checkpoint_prefixes(self) -> tuple[str, ...]:
+        """State-dict prefixes a checkpoint may lack without failing a strict load.
+
+        Used for modules added on top of a pretrained model (e.g. the video TTT
+        memory, absent from benchmark-finetuned checkpoints).
+        """
+        return ()
+
     def load_checkpoint(self, path: str, strict: bool = True) -> None:
         """Load architecture state from a safetensors checkpoint.
 
@@ -699,6 +707,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         has_vlm = getattr(self, "vlm_backbone", None) is not None
         has_meta = any(p.device.type == "meta" for p in self.parameters())
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
+        optional = self._optional_checkpoint_prefixes()
+        if optional:
+            absent_optional = [k for k in missing if k.startswith(optional)]
+            if absent_optional:
+                logger.warning(
+                    "Checkpoint has no weights for %s (%d tensors); keeping their fresh initialisation.",
+                    ", ".join(optional),
+                    len(absent_optional),
+                )
+            missing = [k for k in missing if not k.startswith(optional)]
         if strict and not has_vlm:
             if missing or unexpected:
                 raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
