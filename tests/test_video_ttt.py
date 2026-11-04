@@ -162,6 +162,25 @@ def test_target_loss_gradient_flows_through_write_to_slow_weights():
     assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in branch.init_fast_weights())
 
 
+def test_create_graph_write_inside_no_grad_still_reaches_slow_weights():
+    """Meta-training runs the context pass with the frozen backbone under no_grad
+    (no backbone activations kept); the TTT write itself must still build the graph."""
+    mem = _memory(weight_norm=True)
+    branch = mem.branch(0)
+    nn.init.normal_(branch.o_proj.weight, std=0.1)
+
+    with torch.no_grad():
+        _write(mem, 0, torch.randn(1, 20, DIM), create_graph=True)
+    assert all(w.requires_grad for w in mem.fast_weights(0))
+
+    out = mem.residual(0, torch.randn(1, 20, DIM))
+    out.pow(2).mean().backward()
+    for name in ("k_proj", "v_proj"):
+        grad = getattr(branch, name).weight.grad
+        assert grad is not None and grad.abs().sum() > 0, name
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in branch.init_fast_weights())
+
+
 def test_write_without_create_graph_blocks_meta_gradient():
     mem = _memory()
     branch = mem.branch(0)

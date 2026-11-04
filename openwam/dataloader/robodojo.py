@@ -1033,6 +1033,17 @@ class RoboDojoDataset(BaseDataset):
             "active_arm": "both",
         }
 
+    @property
+    def num_episodes(self) -> int:
+        return len(self._episode_files)
+
+    def episode_length(self, episode_index: int) -> int:
+        return self._episode_lengths[episode_index]
+
+    def build_window(self, episode_index: int, start: int) -> dict[str, Any]:
+        """Sample for the window of ``episode_index`` starting at frame ``start``."""
+        return self._build_sample(episode_index, start)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         if index < 0:
             index += len(self)
@@ -1085,6 +1096,7 @@ class MultiTaskRoboDojoDataset(BaseDataset):
             unify_action_map=_config_get(config, "unify_action_map", None),
             unify_state_map=_config_get(config, "unify_state_map", None),
             color_jitter=_config_get(config, "color_jitter", None),
+            tasks=_config_get(config, "tasks", None),
         )
 
     def __init__(
@@ -1098,6 +1110,7 @@ class MultiTaskRoboDojoDataset(BaseDataset):
         normalization_stats_path: str | Path | None = None,
         action_mode: str = DEPLOY_ACTION_MODE,
         robot: str | None = None,
+        tasks: Sequence[str] | None = None,
         **dataset_kwargs,
     ):
         super().__init__()
@@ -1110,8 +1123,12 @@ class MultiTaskRoboDojoDataset(BaseDataset):
         if variant == ROBODOJO_REAL_VARIANT and calibration is not None:
             raise ValueError("RoboDojo_real uses native per-arm base poses; calibration must be None")
 
+        # ``tasks`` restricts training to a subset. Pass the finetuned checkpoint's
+        # normalization_stats_path alongside it: auto-built stats would cover only
+        # the files on disk, not the corpus the checkpoint was normalised with.
         selected_tasks = resolve_robodojo_tasks(
             dataset_dir,
+            tasks=None if tasks is None else list(tasks),
             embodiment=embodiment,
             variant=variant,
         )
@@ -1198,6 +1215,12 @@ class MultiTaskRoboDojoDataset(BaseDataset):
 
     def denormalize_action(self, action) -> np.ndarray:
         return self._sub_datasets[0].denormalize_action(action)
+
+    def sub_dataset(self, task_name: str) -> "RoboDojoDataset":
+        for dataset in self._sub_datasets:
+            if dataset.task_name == task_name:
+                return dataset
+        raise KeyError(task_name)
 
     def __len__(self) -> int:
         return self._total_length

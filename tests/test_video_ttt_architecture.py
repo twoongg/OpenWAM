@@ -62,7 +62,10 @@ class _DeterministicVideoBackbone(_MockVideoBackbone):
         return state
 
     def finalize(self, state: BlockLoopState):
-        return state.hidden_states
+        # Final hidden state laid out as latents (B, C=dim, F, H, W) so compute_loss can use it.
+        hs = state.hidden_states
+        B, _, D = hs.shape
+        return hs.transpose(1, 2).reshape(B, D, state.grid_frames, state.grid_height, state.grid_width)
 
 
 def _build(ttt_cfg=None):

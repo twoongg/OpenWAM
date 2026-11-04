@@ -51,6 +51,12 @@ from openwam.train.utils.training_utils import (
     reduce_step_metrics,
     write_debug_loss_row,
 )
+from openwam.train.utils.ttt_meta import (
+    TTT_METRIC_KEYS,
+    compute_ttt_meta_losses,
+    reduce_ttt_metrics,
+    resolve_ttt_meta_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +155,19 @@ class OpenWAMTrainer:
         freeze_list = list(getattr(m, "freeze", []))
         for name in self.architecture.freeze_modules(freeze_list):
             logger.info("Frozen: %s", name)
+
+        # --- Video-TTT meta-training: only the TTT slow weights train. Uses
+        # restrict_training_to_ttt (requires_grad only) instead of freeze_modules,
+        # whose no_grad wrapping would cut the gradient path through the backbone.
+        self._ttt_meta = resolve_ttt_meta_config(cfg)
+        if self._ttt_meta is not None:
+            self.architecture.restrict_training_to_ttt()
+            logger.info(
+                "TTT meta-training: only video_ttt.* is trainable (inner_lr=%s, gain_every=%s, context_backbone_grad=%s)",
+                self._ttt_meta.inner_lr,
+                self._ttt_meta.gain_every,
+                self._ttt_meta.context_backbone_grad,
+            )
 
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
@@ -337,6 +356,7 @@ class OpenWAMTrainer:
                 global_step += 1
 
                 metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
+                metrics.update(reduce_ttt_metrics(self.accelerator, losses))
 
                 current_lr = optimizer.param_groups[0]["lr"]
                 _now = _time.monotonic()
@@ -557,6 +577,25 @@ class OpenWAMTrainer:
         if not isinstance(batch, list):
             batch = [batch]
 
+        ttt_meta = getattr(self, "_ttt_meta", None)
+        is_pair_batch = bool(batch) and isinstance(batch[0], dict) and "ttt_context" in batch[0]
+        if ttt_meta is not None or is_pair_batch:
+            if ttt_meta is None or not is_pair_batch:
+                raise ValueError(
+                    "training.ttt_meta.enabled and a TTT pair dataloader (type: robodojo_ttt_pairs) must be used together"
+                )
+            arch = (
+                self.accelerator.unwrap_model(self.architecture) if self.accelerator is not None else self.architecture
+            )
+            return compute_ttt_meta_losses(
+                self.architecture,
+                arch.video_ttt,
+                batch,
+                lambda_video=self.lambda_video,
+                lambda_action=self.lambda_action,
+                meta=ttt_meta,
+            )
+
         inputs = self.architecture.prepare_inputs(batch)
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
@@ -599,6 +638,8 @@ class OpenWAMTrainer:
             postfix = {"loss": f"{loss_total:.4f}", "video": f"{loss_video:.4f}"}
             for name, key in labels:
                 postfix[name] = f"{metrics[key]:.4f}"
+            if "ttt_context_gain" in metrics:
+                postfix["ttt_gain"] = f"{metrics['ttt_context_gain']:.4f}"
             postfix["lr"] = f"{lr:.2e}"
             postfix["epoch"] = epoch
             pbar.set_postfix(postfix)
@@ -616,6 +657,9 @@ class OpenWAMTrainer:
             }
             for name, key in labels:
                 log_dict[f"train/loss_{name}"] = metrics[key]
+            for key in TTT_METRIC_KEYS:
+                if key in metrics:
+                    log_dict[f"train/{key}"] = metrics[key]
             wandb_run.log(log_dict, step=global_step)
 
         if not debug:
