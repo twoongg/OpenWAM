@@ -46,6 +46,8 @@ from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sample
 from openwam.train.utils.training_utils import (
     build_cosine_scheduler,
     cfg_get,
+    combine_runs,
+    init_tensorboard,
     init_wandb,
     log_parameter_counts,
     reduce_step_metrics,
@@ -270,7 +272,10 @@ class OpenWAMTrainer:
         all_params = [p for group in optimizer.param_groups for p in group["params"]]
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
-        wandb_run = None if (debug or not is_main) else init_wandb(self.cfg)
+        # Metric sinks: wandb and/or TensorBoard (project.tensorboard.enabled), main rank only.
+        wandb_run = None
+        if not debug and is_main:
+            wandb_run = combine_runs(init_wandb(self.cfg), init_tensorboard(self.cfg, output_path))
 
         from tqdm import tqdm
 

@@ -75,6 +75,9 @@ project:
   output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
   seed: 42
   wandb:
-    project: openwam
+    project: openwam              # null = wandb off (e.g. no external network)
     run_name: null
     entity: null
+  tensorboard:
+    enabled: false                # true = also write TensorBoard scalars (same keys as wandb)
+    log_dir: null                 # null = <checkpoint output dir>/tensorboard

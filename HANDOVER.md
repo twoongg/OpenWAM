@@ -88,7 +88,15 @@ NPROC_PER_NODE=8 bash scripts/train.sh \
   training.ttt_meta.enabled=true \
   training.finetune_ckpt_path=$CKPT \
   training.num_epochs=null training.max_steps=<N> training.batch_size=<B> \
-  project.output_dir=<out>
+  training.output_path=outputs/ttt_gen \
+  project.wandb.project=null project.tensorboard.enabled=true
+```
+
+**학습 곡선 (TensorBoard — 사내에서 wandb 불가)**: `project.wandb.project=null`로 wandb를 끄고 `project.tensorboard.enabled=true`. 로그는 `<training.output_path>/<시각>/tensorboard/`에 쌓임 (wandb와 같은 태그: `train/loss`, `train/loss_video`, `train/loss_action`, `train/grad_norm`, `train/lr`, `train/ttt_context_gain`, `train/ttt_loss_no_context`).
+
+```bash
+tensorboard --logdir outputs/ttt_gen --port 6006          # 여러 run을 한 번에 비교
+ssh -L 6006:localhost:6006 <학습서버>                      # 서버에서 돌리면 로컬 브라우저로 http://localhost:6006
 ```
 
 - **`normalization_stats_path`는 반드시 ckpt 것** (안 주면 디스크에 있는 12 task로 통계를 새로 만들어 action 스케일이 어긋남. placeholder 그대로면 바로 에러).
