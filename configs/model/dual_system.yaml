@@ -36,5 +36,15 @@ architecture:
   bridge_interval: 1
 
   mot_checkpoint_mixed_attn: true  # joint_self_attn/idm only: grad-checkpoint the mixed attention (VRAM down)
+
+  # Video-expert TTT memory (joint_self_attn only): fast-weight residual branches
+  # added to the video stream (WAM-TTT style). Disabled → architecture unchanged.
+  ttt:
+    enabled: false
+    layers: null        # DiT block indices; null = every block
+    num_heads: 8        # fast-weight heads
+    head_dim: 64        # per-head key/value width
+    hidden_dim: 128     # SwiGLU fast-weight hidden width
+    weight_norm: true   # renormalise fast-weight rows after each write (stable over many writes)
   detach_bridge: false             # joint_cross_attn only
   idm_video_cond_noise_prob: 0.5   # idm only
