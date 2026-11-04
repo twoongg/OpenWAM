@@ -141,4 +141,5 @@ ssh -L 6006:localhost:6006 <학습서버>                      # 서버에서 �
 2. `ttt_context_episodes`(기본 1) / `ttt_context_windows`(기본 4) — 2번 evolving은 여러 episode가 쌓이므로 1-b에서 늘려볼지.
 3. 쓰기 loss: A) KV 재구성만(현재) / B) test time에 video loss 추가 / C) 논문대로.
 4. 2번에서 WAM 단독 성공도 써넣을지, 쓰기 입력의 noise level·action 포함 여부.
-5. WAM-TTT Appendix B 하이퍼파라미터(N, η, λ, d, f_h) PDF로 확인.
+5. **inner LR** (`training.ttt_meta.inner_lr`, 기본 0.1): WAM-TTT Table B.1 원문 값(meta 0.1 / test 0.01)을 가져왔지만, 그쪽은 inner loss가 video loss + 0.04×KVM이고 우리는 KVM만이라 그대로 대응 안 됨 → 300~500 step 짧은 run으로 0.01 / 0.1 / 1.0 비교, `ttt_context_gain` 제일 잘 오르는 값.
+6. **batch / steps**: OpenWAM Table 10의 RoboDojo SFT는 global batch 256 · 60k step (64 GPU). H100 8장이면 `training.batch_size=16 training.gradient_accumulation_steps=2`(=256), OOM이면 8×4. 60k step은 8장 기준 원래의 ~20배 시간이라 PoC는 2~3k step부터.
