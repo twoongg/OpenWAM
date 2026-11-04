@@ -25,8 +25,15 @@
 | **Spatial-TTT** (THU-SI/Spatial-TTT) | SwiGLU fast weight, zero-init 출력, 스트리밍으로 fast-weight state를 들고 다니는 구조 (evolving 누적과 대응). 단 Qwen3-VL(causal LLM)용이고 attention을 *교체*함 |
 | **LaCT** (a1600012888/LaCT) | Spatial-TTT 커널의 원본. weight norm(업데이트 후 row norm을 초기값으로 되돌림), Wan2.1 기반 AR video 코드 |
 
-WAM-TTT에서 **verbatim으로 확인 못 한 값** (Appendix B/Table B.1, 요약본에서만 봄 — 사용 전 PDF 확인 필요):
-N=1 inner step, η=0.1(meta)/0.01(test), λ=1e-2, TTT head dim d=48, hidden f_h=128, 적용 블록 수, optimizer 설정.
+WAM-TTT **Table B.1 (v3 PDF 원문 확인, 2026-11-04)**:
+inner SGD N=1 (meta·test 동일), inner LR η = **0.1 (meta-training) / 0.01 (test time)**, memory reconstruction weight **λ = 4×10⁻²**,
+TTT head dim d=48 / fast-weight hidden f_h=128 (LDA: 16 blocks, D=1536, 32 heads), outer AdamW(0.9, 0.999) wd 1e-8,
+outer LR 1e-4 (DiT action head) / 1e-5 (VLM interface), cosine (min 5e-7, 5k warmup), 100k steps, batch 16/device · 128 global, 8×H800 ZeRO-2.
+Inner loop = "N full-network SGD steps" on L_vg^human + λ·ΣL_KVM (Algorithm A.1). 적용 블록 수는 표에 없음 (Algorithm A.1은 모든 ℓ에 residual 적용).
+
+**우리 설정과의 관계**: 우리 inner loss는 KVM만(가중치 1) → 같은 η=0.1이면 KVM 쪽 한 스텝이 WAM-TTT(0.1×0.04)보다 ~25배 큼. η=0.1은 숫자만 가져온 것이고 조정 안 됨 → 짧은 sweep(0.01/0.1/1.0, `ttt_context_gain` 기준) 권장. outer LR 1e-4는 OpenWAM SFT(Table 9)·WAM-TTT 모두와 일치 (LaCT는 새 TTT 가중치에 기본 LR×10).
+
+OpenWAM 논문 Table 10 (원문 확인): RoboDojo SFT = **global batch 256, 60k steps, ColorJitter** (ckpt config의 GPU당 4 → 64 GPU). → ckpt는 학습 window(~372만)를 약 4 epoch 봄.
 
 WAM-TTT ablation (v1 Table 2, verbatim): full 100.0/88.9, w/o TTT 40.0/74.1, **w/o meta-training 9.0/0.0**, test-time LoRA 30.0/0.0, w/o memory recon 66.7/72.0 (Table Bussing / Swap Place).
 → meta-training 없이 TTT 레이어만 붙이면 오히려 나빠짐. 그래서 TTT slow weight 학습 단계가 필수.
@@ -87,7 +94,7 @@ config: `model.architecture.ttt.enabled=true model.architecture.ttt.layers=[0,10
    - **근거 공백**: WAM-TTT는 KVM을 뺀 ablation만 있고 "KVM만" ablation은 없음 → 손해 크기는 실험으로 확인해야 함.
    - 대안: B) meta-training은 KVM, test time에만 video loss 추가 / C) 논문대로 (first-order 근사 고려). 권장: A로 evolving 곡선 확인 → 안 오르면 B를 ablation.
 2. **읽고 나서 쓰기** (한 forward 안에서 현재 W로 residual 계산 → 같은 입력으로 W 갱신).
-3. **기본 크기**: heads 8 × head_dim 64, hidden 128, 30개 전 블록 → TTT 파라미터 **194.6M** (블록당 ~6.5M, 대부분 θ_{Q,K,V,O}). WAM-TTT 값(d=48)은 미확인이라 임의로 정함.
+3. **기본 크기**: heads 8 × head_dim 64, hidden 128, 30개 전 블록 → TTT 파라미터 **194.6M** (블록당 ~6.5M, 대부분 θ_{Q,K,V,O}). WAM-TTT는 d=48/f_h=128 (D=1536 기준, Table B.1); 우리 값은 D=3072에 맞춰 임의로 정함.
 4. **`freeze:` 대신 `restrict_training_to_ttt()`**: OpenWAM의 `freeze_modules`는 고정 모듈의 forward를 하위 모듈까지 전부 `no_grad`로 감쌈. Wan은 residual 덧셈을 `GateModule`(nn.Module) 안에서 하므로 그대로 쓰면 residual stream이 끊겨 앞쪽 TTT 레이어에 gradient가 안 옴 (실제 Wan 블록 테스트로 확인). → `requires_grad`만 끄는 경로를 따로 둠. **meta-training 설정에서 `video_backbone`/`action_backbone`을 `freeze:` 목록에 넣으면 안 됨.**
 5. **TTT 켜지면 `torch.compile` 루프 끔**: fast weight state가 호출마다 바뀌고 쓰기 때 autograd가 돌아서. deploy 속도 손해 가능.
 6. **weight norm 기본 on**: 50번 연속 쓰기에서 fast weight 크기 폭주 방지 (테스트로 row norm 유지 확인).
@@ -141,7 +148,7 @@ python scripts/ttt/check_checkpoint_compat.py <ckpt_dir> \
 3. **trainer 통합**: `model.architecture.ttt.train_only` 같은 플래그 → `freeze_modules` 이후 `restrict_training_to_ttt()` 호출. step = `reset` → context 쓰기(`create_graph=True`) → target `compute_loss` → backward. `finetune_ckpt_path`로 RoboDojo 체크포인트 로드 시 TTT 키 누락 허용되는지 trainer 경로(`train/utils/ckpt_model_loader.py`)도 확인.
 4. **쓰기 입력 결정**: context를 어떤 noise level로 넣을지 (`min/max_timestep_boundary`로 저노이즈 제한 권장), action 포함 여부 (`mutual` mask라 video가 action을 봄 → 에이전트 episode의 실제 action을 넣는 쪽이 학습 분포에 가까움).
 5. **evolving 평가 루프**: deploy/policy server에 task 시작 시 `reset`, TC 종료 후 성공 episode 쓰기 API 추가. 곡선 3종(없음/리셋/누적) 로깅. fast weight state가 `state_dict`에 없으므로 프로세스 간 유지가 필요하면 별도 저장 추가.
-6. WAM-TTT Appendix B 하이퍼파라미터 PDF로 확인 후 기본값 조정.
+6. ~~WAM-TTT Appendix B 하이퍼파라미터 PDF로 확인~~ → 확인 완료(§2). 남은 일: inner LR sweep.
 7. (필요 시) 옵션 B/C: inner loop에 video generation loss 추가.
 
 ## 8. 환경 재현
