@@ -124,6 +124,9 @@ class VideoTTTBranch(nn.Module):
     ) -> FastWeights:
         """One inner SGD step on the reconstruction loss of ``h``; returns new (B, H, r, c) weights."""
         B = h.shape[0]
+        # Everything stays under enable_grad: meta-training runs the (frozen) backbone
+        # of the context pass under no_grad, and the new weights must still carry the
+        # graph back to θ_K / θ_V / W_init when create_graph=True.
         with torch.enable_grad():
             k, v = self._keys_values(h)
             ws = [_batched(w.float(), B) for w in weights]
@@ -135,10 +138,10 @@ class VideoTTTBranch(nn.Module):
             loss = (_apply_fast_weights(tuple(ws), k) - v).pow(2).mean(dim=(1, 2, 3)).sum()
             grads = torch.autograd.grad(loss, ws, create_graph=create_graph)
 
-        new = [w - lr * g for w, g in zip(ws, grads)]
-        if weight_norm:
-            ref_norms = [w.float().norm(dim=-1, keepdim=True) for w in self.init_fast_weights()]
-            new = [n / (n.norm(dim=-1, keepdim=True) + _EPS) * r for n, r in zip(new, ref_norms)]
+            new = [w - lr * g for w, g in zip(ws, grads)]
+            if weight_norm:
+                ref_norms = [w.float().norm(dim=-1, keepdim=True) for w in self.init_fast_weights()]
+                new = [n / (n.norm(dim=-1, keepdim=True) + _EPS) * r for n, r in zip(new, ref_norms)]
         if not create_graph:
             new = [n.detach() for n in new]
         return tuple(new)

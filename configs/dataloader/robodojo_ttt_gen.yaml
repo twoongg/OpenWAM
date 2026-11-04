@@ -1,0 +1,34 @@
+# Video-TTT meta-training, step 1: RoboDojo Generalization tasks only.
+# Same RoboDojo reader as robodojo.yaml; each item = a target window + windows from
+# other episodes of the same task (the "context" written into the TTT memory).
+#
+# Use with: model.architecture.ttt.enabled=true training.ttt_meta.enabled=true
+#           training.finetune_ckpt_path=<RoboDojo-finetuned OpenWAM-α ckpt dir>
+defaults:
+  - robodojo
+  - _self_
+
+type: robodojo_ttt_pairs
+
+# [Required] the finetuned checkpoint's stats. The frozen model was trained with stats
+# pooled over all 35 RoboDojo training tasks; auto-built stats on this 12-task subset
+# (or on whatever subset is on disk) would rescale actions and break the policy.
+normalization_stats_path: /path/to/ckpt_dir/normalization_stats.npy
+
+# RoboDojo "Generalization" dimension (eval: 25 standard + 25 <task>_random layouts per seed).
+tasks:
+  - arrange_largest_number
+  - fold_clothes
+  - hang_mugs
+  - make_toast
+  - pack_objects_into_box
+  - pour_liquid_into_cup
+  - push_T
+  - sort_nesting_dolls_by_size
+  - stack_blocks
+  - stack_bowls
+  - store_laptop_and_headphones
+  - sweep_blocks
+
+ttt_context_episodes: 1           # other episodes of the same task written before the target
+ttt_context_windows: 4            # evenly spaced 33-frame windows per context episode, in time order

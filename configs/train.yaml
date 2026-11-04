@@ -47,6 +47,15 @@ training:
   max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)
   min_timestep_boundary: 0.0      # Lower bound (fraction of total timesteps)
 
+  # --- Video-TTT meta-training (needs model.architecture.ttt.enabled + dataloader type robodojo_ttt_pairs) ---
+  # Only video_ttt.* trains; each step writes the item's same-task context windows into
+  # the TTT memory, then takes the usual loss on the target window.
+  ttt_meta:
+    enabled: false
+    inner_lr: 0.1                 # fast-weight SGD step size for each context write
+    gain_every: 50                # every N steps also log loss without context (ttt_context_gain); 0 = off
+    context_backbone_grad: false  # true = keep backbone graph for context passes (exact, much more memory)
+
   # --- Checkpoint ---
   output_path: outputs/openwam_checkpoints            # Base directory for checkpoint output (relative to the launch cwd)
   save_steps: 2000                # Save checkpoint every N steps (0 or null = disable saving)
@@ -66,6 +75,9 @@ project:
   output_dir: outputs/${now:%Y-%m-%d_%H-%M-%S}
   seed: 42
   wandb:
-    project: openwam
+    project: openwam              # null = wandb off (e.g. no external network)
     run_name: null
     entity: null
+  tensorboard:
+    enabled: false                # true = also write TensorBoard scalars (same keys as wandb)
+    log_dir: null                 # null = <checkpoint output dir>/tensorboard

@@ -91,6 +91,10 @@ config: `model.architecture.ttt.enabled=true model.architecture.ttt.layers=[0,10
 4. **`freeze:` 대신 `restrict_training_to_ttt()`**: OpenWAM의 `freeze_modules`는 고정 모듈의 forward를 하위 모듈까지 전부 `no_grad`로 감쌈. Wan은 residual 덧셈을 `GateModule`(nn.Module) 안에서 하므로 그대로 쓰면 residual stream이 끊겨 앞쪽 TTT 레이어에 gradient가 안 옴 (실제 Wan 블록 테스트로 확인). → `requires_grad`만 끄는 경로를 따로 둠. **meta-training 설정에서 `video_backbone`/`action_backbone`을 `freeze:` 목록에 넣으면 안 됨.**
 5. **TTT 켜지면 `torch.compile` 루프 끔**: fast weight state가 호출마다 바뀌고 쓰기 때 autograd가 돌아서. deploy 속도 손해 가능.
 6. **weight norm 기본 on**: 50번 연속 쓰기에서 fast weight 크기 폭주 방지 (테스트로 row norm 유지 확인).
+7. **meta-training 쌍 = 같은 task, 같은 조건(표준 장면), 다른 episode** (`robodojo_ttt_pairs`). GenRand(`_random`) demo가 공식 데이터에 없고, test time의 context도 "같은 조건에서의 성공"이라서. gen→genrand 쌍은 데이터가 없고 학습 목표도 test time과 다름 (깨끗한 demo를 context로 쓰는 건 test-time baseline으로만).
+8. **context pass는 backbone `no_grad`가 기본**: context window마다 6B backbone activation을 backward까지 들고 있지 않도록. TTT 쓰기(`update`)는 `enable_grad` 안에서 그래프를 만듦 → θ_K/θ_V/W_init까지 meta-gradient 도달(테스트로 확인). 대신 context 쪽 레이어 간 상호작용은 미분 안 함 (`context_backbone_grad=true`로 정확한 버전).
+9. **context window**: context episode마다 33프레임 window 4개를 처음~끝 균등 간격, 시간 순서로 (`ttt_context_windows`). test time엔 성공 episode 전체를 window 단위로 쓰게 되므로 학습/테스트 window 수가 다름 — 1-b에서 조정 대상.
+10. **`ttt_context_gain` 로깅**: 같은 noise/timestep으로 context 있을 때·없을 때 target loss 차이. TTT가 "고정 adapter"가 됐는지(≈0) "써넣은 걸 쓰는지"(>0) 구분용.
 
 ## 5. 검증 현황 (Mac M4 16GB, CPU)
 
@@ -125,6 +129,8 @@ python scripts/ttt/check_checkpoint_compat.py <ckpt_dir> \
 | RoboDojo 시뮬 평가 / 실시간 에이전트 루프 | ❌ | GPU + XPolicyLab 환경 |
 
 ## 7. 사내에서 이어갈 작업 (순서대로)
+
+> 2026-11-04 추가: 아래 2·3번(쌍 dataloader, trainer 통합)은 구현됨 — 실행법은 `HANDOVER.md` Step 2. RoboDojo 구조 확인 결과도 HANDOVER §1.
 
 1. **실가중치 smoke test (GPU 1장)**: `load_from_checkpoint_dir` + `ttt.enabled=true`로 로드 → 같은 입력에서 TTT on/off 출력이 bit 동일한지 확인 → `o_proj`를 작은 랜덤값으로 바꾸고 쓰기 전후 출력이 달라지는지 확인. bf16에서 fast weight fp32 경로 확인.
 2. **meta-training 데이터**: RoboDojo 트레이닝셋에서 같은 task의 episode 쌍 (context → target).

@@ -114,6 +114,61 @@ def init_wandb(cfg):
     return run
 
 
+class TensorBoardRun:
+    """Minimal stand-in for a wandb run (``log(dict, step=)`` / ``finish()``) writing TensorBoard scalars."""
+
+    def __init__(self, log_dir: str):
+        from torch.utils.tensorboard import SummaryWriter
+
+        self.log_dir = log_dir
+        self._writer = SummaryWriter(log_dir=log_dir)
+
+    def log(self, data: dict, step=None) -> None:
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if isinstance(value, (int, float)):
+                self._writer.add_scalar(key, float(value), global_step=step)
+        self._writer.flush()
+
+    def finish(self) -> None:
+        self._writer.close()
+
+
+class _FanoutRun:
+    def __init__(self, runs):
+        self._runs = runs
+
+    def log(self, data: dict, step=None) -> None:
+        for run in self._runs:
+            run.log(data, step=step)
+
+    def finish(self) -> None:
+        for run in self._runs:
+            run.finish()
+
+
+def combine_runs(*runs):
+    """None / the single run / a fan-out over several metric runs (wandb, TensorBoard)."""
+    present = [run for run in runs if run is not None]
+    if not present:
+        return None
+    return present[0] if len(present) == 1 else _FanoutRun(present)
+
+
+def init_tensorboard(cfg, output_path: str):
+    """TensorBoard run from ``cfg.project.tensorboard`` (log_dir defaults to <output_path>/tensorboard)."""
+    from omegaconf import OmegaConf
+
+    tb_cfg = OmegaConf.select(cfg, "project.tensorboard", default=None)
+    if tb_cfg is None or not bool(tb_cfg.get("enabled", False)):
+        return None
+    log_dir = tb_cfg.get("log_dir", None) or os.path.join(output_path, "tensorboard")
+    run = TensorBoardRun(str(log_dir))
+    logger.info("TensorBoard logging to %s", log_dir)
+    return run
+
+
 def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
     """Reduce loss/grad_norm across ranks (mean); single-process fast path."""
     loss = losses["total"]
