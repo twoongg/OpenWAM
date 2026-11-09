@@ -31,6 +31,7 @@
 | **[1번용] meta-training step** `openwam/train/utils/ttt_meta.py` + trainer 연결 (`training.ttt_meta`) | ✅ |
 | **[1번용] config** `configs/dataloader/robodojo_ttt_gen.yaml` (Generalization 12 task) | ✅ Hydra compose 확인 |
 | 테스트 (TTT 54개: `tests/test_video_ttt*.py`, `test_robodojo_ttt_pairs.py`, `test_ttt_meta*.py`) | ✅ 전체 1990 passed / 40 skipped(기존 GPU 테스트) |
+| **LoRA 학습 지원** `openwam/model/lora.py` + `model.architecture.lora` + trainer (§5) | ✅ LIBERO ckpt 호환 확인, 전체 2011 passed |
 
 **RoboDojo 사실 확인** (공식 데이터셋·RoboDojo 레포·XPolicyLab에서 직접 확인):
 - 평가: 42 task × seed {0,1,2}. Generalization 12 / Precision 8 / Long-Horizon 8 / Memory 6 / Open 8. 일반 task는 seed당 앞 50 layout, Generalization은 표준 25 + `<task>_random` 25.
@@ -143,3 +144,39 @@ ssh -L 6006:localhost:6006 <학습서버>                      # 서버에서 �
 4. 2번에서 WAM 단독 성공도 써넣을지, 쓰기 입력의 noise level·action 포함 여부.
 5. **inner LR** (`training.ttt_meta.inner_lr`, 기본 0.1): WAM-TTT Table B.1 원문 값(meta 0.1 / test 0.01)을 가져왔지만, 그쪽은 inner loss가 video loss + 0.04×KVM이고 우리는 KVM만이라 그대로 대응 안 됨 → 300~500 step 짧은 run으로 0.01 / 0.1 / 1.0 비교, `ttt_context_gain` 제일 잘 오르는 값.
 6. **batch / steps**: OpenWAM Table 10의 RoboDojo SFT는 global batch 256 · 60k step (64 GPU). H100 8장이면 `training.batch_size=16 training.gradient_accumulation_steps=2`(=256), OOM이면 8×4. 60k step은 8장 기준 원래의 ~20배 시간이라 PoC는 2~3k step부터.
+
+## 5. LoRA 학습 (TTT 대신 DAgger식 업데이트, 1단계)
+
+TTT 메타학습 대신 성공 trajectory(지금은 libero-plus demo가 proxy)로 **LoRA만** 학습. base는 고정, adapter는 zero-init이라 학습 전엔 릴리즈 모델과 출력이 같음.
+
+| 항목 | 내용 |
+|---|---|
+| 코드 | `openwam/model/lora.py` (forward hook 방식, 원래 `nn.Linear` 가중치·키는 그대로) |
+| config | `model.architecture.lora.{enabled, rank, alpha, dropout, experts, modules}` (`configs/model/dual_system.yaml`) |
+| 붙는 곳 | `experts`: `action` → `action_backbone.blocks.N`, `video` → `video_backbone.dit.blocks.N` / `modules`: `self_attn`(q,k,v,o), `cross_attn`(q,k,v,o), `ffn` |
+| 크기 (LIBERO ckpt, rank 16) | action만(기본) 180 Linear · 12.8M / action+video 360 Linear · 41.3M |
+| 학습 대상 | `lora.enabled=true`면 trainer가 `restrict_training_to_lora()` 자동 호출 → `lora.*`만 학습 |
+| LR | `training.learning_rate` 하나만 적용 (`action_lr`/`video_lr`는 LoRA에 안 걸림) |
+| 체크포인트 | `lora.*` 없는 릴리즈 ckpt도 로드됨 (경고 1줄). 저장은 전체 모델 + adapter라 ckpt 하나가 큼 → `save_steps` 넉넉히 |
+| deploy | 저장된 `config.yaml`에 `lora`가 들어가서 자동으로 adapter 빌드·로드. **adapter가 있으면 compile 끔(eager)** → 추론 느려짐 |
+| 리셋 | `arch.lora.reset_parameters()` → 전부 0 업데이트로 (2단계에서 task/view 시퀀스 시작할 때) |
+
+```bash
+CKPT=assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-LIBERO
+NPROC_PER_NODE=8 bash scripts/train.sh \
+  dataloader=<사내 libero-plus demo 설정> \
+  model.architecture.lora.enabled=true \
+  model.architecture.lora.rank=16 model.architecture.lora.alpha=16 \
+  'model.architecture.lora.experts=[action]' \
+  training.finetune_ckpt_path=$CKPT \
+  training.learning_rate=1e-4 \
+  training.num_epochs=null training.max_steps=<N> training.save_steps=<N> \
+  training.output_path=outputs/lora_libero_plus \
+  project.wandb.project=null project.tensorboard.enabled=true
+```
+
+- 호환성 확인 (가중치 없이): `python scripts/ttt/check_checkpoint_compat.py $CKPT --hf-repo OpenWAM/OpenWAM-Alpha-Sim-LIBERO --filename checkpoint_step_10690.safetensors --no-ttt --lora --lora-experts action,video`
+- 1단계 실험 설계: 교란 view 하나에서 demo k=1/5/20개로 학습 → 그 view held-out demo의 open-loop action loss + closed-loop ≥30 trial + 원래 view 성공률(잊어버림). 대조군 = 같은 k개를 원래 view demo로 학습.
+- 잊어버림 방지로 원래 LIBERO 샘플을 섞을 거면 `MixtureDataset`(`openwam/dataloader/mixture.py`)로 두 데이터셋을 섞음.
+- `training.ttt_meta`와 같이 켜면 trainer가 에러 (각자 자기 파라미터만 학습시키므로).
+- 아직 없는 것: adapter만 따로 저장/로드, 학습 중 frame 단위 loss 마스크(개입 구간만 학습), 2단계(teacher = 원래 view 렌더링) 루프.
