@@ -180,3 +180,59 @@ python scripts/flowdagger/inversion_probe.py --ckpt-dir <같은 ckpt> \
 - demo는 체크포인트의 `normalization_stats.npy`로 정규화함 (새 demo로 통계를 다시 만들지 않음). min-max라 범위 밖 값은 [-1,1]로 잘림.
 - reader가 데이터 형식을 거부하면(conversion.json 없음 등) 형식이 다른 것 — 이 경우 말해줄 것.
 - 테스트: `tests/test_flowdagger_*.py` (작은 실제 Wan+ActionDiT, CPU). 생성 루프가 `generate()`와 비트 단위로 같은지, 되감기가 자기 노이즈를 복원하는지, 고정 첫 프레임·비활성 action dim 유지, 스크립트 전체 배선까지.
+
+**결과 (2026-11-09, 회사):** open-loop라 판정에 못 씀. LoRA closed-loop 결과(교란 view 6/30 → 20/30)와 반대로 나왔음. demo와의 거리는 성공 여부를 예측하지 못함. 이 측정은 회귀 감시용으로만 남김.
+
+## 6. FlowDAgger 상한 closed-loop 측정 — 노이즈 정답지 서버 (브랜치 `inversion-probe`)
+
+질문: **"노이즈를 완벽하게 고르면 교란 view에서 얼마나 성공하나?"** 이 값이 FlowDAgger의 사실상 상한임. 학습은 하지 않고 가중치도 그대로 둠.
+
+seed sweep(5개)에서는 평범한 노이즈로 9/30까지 감. 그런데 거꾸로 계산해서 찾은 노이즈는 평범하지 않았음(std 2.6). 그래서 그 영역의 노이즈로 실제 로봇이 움직이는지 직접 확인함.
+
+매 replan마다 서버가 하는 일 (`openwam/flowdagger/oracle.py`):
+1. **선생**: 같은 얼린 모델에 **원래 view**를 보여주고 action chunk를 만듦. stock 성공률은 97~100%.
+2. **학생**: 같은 모델에 **교란 view**를 보여줌. 선생 action이 나오도록 시작 노이즈를 거꾸로 계산함(§5와 같은 방식). 목표는 학생 자신의 비디오에 action만 선생 것으로 바꾼 것.
+3. 그 노이즈로 학생을 돌려서 나온 **학생의 출력**을 로봇에 보냄. 학생이 못 따라한 부분은 그대로 rollout에 남음.
+
+### driver 쪽에 추가할 것 (회사 Claude 담당)
+
+매 step obs에 원래 카메라 위치에서 렌더한 이미지를 같이 보내면 됨.
+
+```json
+{"type": "obs",
+ "images":         {"head_camera": <교란 view>, "left_wrist_camera": <wrist>},
+ "teacher_images": {"head_camera": <같은 상태, 원래 view>},
+ "prompt": "...", "state": [...]}
+```
+- `teacher_images`에서 빠지거나 null인 카메라는 `images`의 것을 그대로 씀. 카메라 교란이 3인칭 카메라만 옮긴다면 `head_camera` 하나만 보내면 됨.
+- 원래 view 렌더는 baseview650 대조군을 만들 때 다시 렌더했던 방식을 그대로 쓰면 됨. 같은 MuJoCo 상태에 원래 카메라 pose를 쓰면 됨.
+- PONG에 `oracle_mode`가 실려 오므로 driver에서 모드를 확인할 수 있음.
+
+### 실행 — 같은 시작 위치 30개(env seed 42)에서 모드 3개를 각각 돌림
+
+```bash
+git fetch && git checkout inversion-probe
+CK=<OpenWAM-Alpha-Sim-LIBERO>
+python scripts/flowdagger/oracle_server.py --ckpt-dir $CK --mode teacher --port 8877 --log results/oracle/teacher.jsonl
+python scripts/flowdagger/oracle_server.py --ckpt-dir $CK --mode student --port 8877 --log results/oracle/student.jsonl
+python scripts/flowdagger/oracle_server.py --ckpt-dir $CK --mode oracle  --port 8877 --log results/oracle/oracle.jsonl
+```
+나머지 플래그(`--denoise-steps`, `--inference-horizon`, ...)는 stock 서버와 같음. compile과 DiT velocity cache는 항상 꺼짐: 거꾸로 계산하려면 캐시 없는 같은 sampler가 필요하고, 세 모드가 같은 경로를 써야 비교가 됨. `--seed`는 시작 노이즈 seed이고 기본값 42임.
+
+### 읽는 법
+
+| 모드 | 의미 | 예상 |
+|---|---|---|
+| `teacher` | 배선 확인. 원래 view로 로봇을 움직임 | stock 수준(29~30/30). 낮으면 렌더/배선 문제이므로 oracle 결과를 믿지 말 것 |
+| `student` | 같은 경로(eager, 캐시 없음)에서의 기준선 | zeroed eager 6/30 근처 |
+| `oracle` | **노이즈를 완벽하게 골랐을 때 = FlowDAgger 상한** | 높으면(예: 20/30 이상) FlowDAgger가 해볼 만함. student 수준이면 이 문제는 노이즈로 못 고침 → LoRA |
+
+`oracle.jsonl`에는 chunk마다 한 줄씩 기록됨. 키는 `episode`, `chunk`, `base_mse`(학생이 그냥 돌렸을 때 선생과의 차이), `recon_mse`(노이즈를 바꾼 뒤 차이), `base/recon_per_dim`, `noise_action`(std, |w|>3 비율), `fp_action_update_last`, `video_drift`, `seconds`.
+- oracle 결과가 낮을 때: `recon_mse`가 `base_mse`보다 크게 줄었으면 "선생을 따라하긴 했는데도 실패"한 것임. 이상한 노이즈가 closed-loop에서 안 통한다는 뜻. 안 줄었으면 "따라하지도 못함"이고, 이때는 `--fp-iters 20`으로 다시 확인함.
+- 비용(실측 안 함): replan당 forward가 oracle 80번(선생 10 + 학생 10 + 되감기 50 + 재생성 10), teacher 10번, student 10번. oracle은 느리므로 10 trial부터 돌려보기를 권함.
+- 테스트: `tests/test_flowdagger_oracle.py` (CPU 작은 모델). 다음을 확인함:
+  - student/teacher 모드가 `generate()`와 비트 단위로 같음
+  - oracle이 선생 action에 도달함
+  - 학생 비디오가 유지됨
+  - wrist fallback, reset 시 episode 증가, 로그
+  - eager·캐시 꺼짐 강제, async 거부, CLI 배선
