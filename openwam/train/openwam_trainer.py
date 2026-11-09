@@ -162,6 +162,16 @@ class OpenWAMTrainer:
         # restrict_training_to_ttt (requires_grad only) instead of freeze_modules,
         # whose no_grad wrapping would cut the gradient path through the backbone.
         self._ttt_meta = resolve_ttt_meta_config(cfg)
+        lora = getattr(self.architecture, "lora", None)
+        if self._ttt_meta is not None and lora is not None:
+            raise ValueError(
+                "training.ttt_meta and model.architecture.lora cannot be combined: "
+                "each restricts training to its own parameters"
+            )
+        if lora is not None:
+            # Same reason as below: requires_grad only, the frozen experts stay on the gradient path.
+            self.architecture.restrict_training_to_lora()
+            logger.info("LoRA training: only lora.* is trainable (%d adapted Linear layers)", len(lora.targets))
         if self._ttt_meta is not None:
             self.architecture.restrict_training_to_ttt()
             logger.info(
