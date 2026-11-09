@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Check that an OpenWAM checkpoint loads into a TTT- / LoRA-enabled architecture — without its weights.
+"""Check that an OpenWAM checkpoint loads into a TTT-enabled architecture — without its weights.
 
 Runs the real deploy loader (``load_from_checkpoint_dir``) end to end, but feeds
 it meta tensors built from the safetensors *header* (names / shapes / dtypes),
 and the model is built on the meta device, so no 25 GB weight file has to be
 downloaded or held in RAM. Catches key-name or shape drift between the
-checkpoint and the TTT- / LoRA-augmented architecture, and exercises the
-strict-load rule that lets ``video_ttt.*`` / ``lora.*`` be absent.
+checkpoint and the TTT-augmented architecture, and exercises the strict-load
+rule that lets ``video_ttt.*`` be absent.
 
 Usage (checkpoint dir holds config.yaml + tokenizer/; weights may be absent):
 
@@ -16,10 +16,6 @@ Usage (checkpoint dir holds config.yaml + tokenizer/; weights may be absent):
 
     # header read from a local safetensors file inside <ckpt_dir>
     python scripts/ttt/check_checkpoint_compat.py <ckpt_dir> --filename checkpoint_step_60000.safetensors
-
-    # LoRA instead of TTT (adapters on the action and video experts)
-    python scripts/ttt/check_checkpoint_compat.py <ckpt_dir> --hf-repo OpenWAM/OpenWAM-Alpha-Sim-LIBERO \
-        --filename checkpoint_step_10690.safetensors --no-ttt --lora --lora-experts action,video
 """
 
 from __future__ import annotations
@@ -54,14 +50,12 @@ def _header(ckpt_dir: str, filename: str, hf_repo: str | None) -> dict[str, tupl
     return out
 
 
-def _staged_ckpt_dir(ckpt_dir: str, ttt: dict | None, lora: dict | None = None) -> str:
-    """Temp copy of the checkpoint dir whose config enables TTT / LoRA (assets symlinked, weights not needed)."""
+def _staged_ckpt_dir(ckpt_dir: str, ttt: dict | None) -> str:
+    """Temp copy of the checkpoint dir whose config enables TTT (assets symlinked, weights not needed)."""
     tmp = tempfile.mkdtemp(prefix="ttt_ckpt_check_")
     cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
     if ttt is not None:
         OmegaConf.update(cfg, "model.architecture.ttt", ttt, force_add=True)
-    if lora is not None:
-        OmegaConf.update(cfg, "model.architecture.lora", lora, force_add=True)
     OmegaConf.save(cfg, os.path.join(tmp, "config.yaml"))
     for name in os.listdir(ckpt_dir):
         if name != "config.yaml" and not name.endswith(".safetensors") and not name.startswith("."):
@@ -79,10 +73,6 @@ def main() -> int:
     ap.add_argument("--ttt-num-heads", type=int, default=8)
     ap.add_argument("--ttt-head-dim", type=int, default=64)
     ap.add_argument("--ttt-hidden-dim", type=int, default=128)
-    ap.add_argument("--lora", action="store_true", help="also attach LoRA adapters")
-    ap.add_argument("--lora-rank", type=int, default=16)
-    ap.add_argument("--lora-experts", default="action", help="comma-separated: action,video")
-    ap.add_argument("--lora-modules", default="self_attn,ffn", help="comma-separated: self_attn,cross_attn,ffn")
     args = ap.parse_args()
 
     ttt = None
@@ -94,16 +84,6 @@ def main() -> int:
             "head_dim": args.ttt_head_dim,
             "hidden_dim": args.ttt_hidden_dim,
             "weight_norm": True,
-        }
-
-    lora = None
-    if args.lora:
-        lora = {
-            "enabled": True,
-            "rank": args.lora_rank,
-            "alpha": args.lora_rank,
-            "experts": args.lora_experts.split(","),
-            "modules": args.lora_modules.split(","),
         }
 
     header = _header(args.ckpt_dir, args.filename, args.hf_repo)
@@ -126,16 +106,12 @@ def main() -> int:
         if ttt_mod is not None:
             report["ttt_layers"] = list(ttt_mod.layers)
             report["ttt_params"] = sum(p.numel() for p in ttt_mod.parameters())
-        lora_mod = getattr(self, "lora", None)
-        if lora_mod is not None:
-            report["lora_targets"] = list(lora_mod.targets)
-            report["lora_params"] = sum(p.numel() for p in lora_mod.parameters())
         return original_load(self, path, strict=strict)
 
     def meta_load_file(_path, device="cpu"):
         return {k: torch.empty(shape, dtype=dtype, device="meta") for k, (dtype, shape) in header.items()}
 
-    staged = _staged_ckpt_dir(args.ckpt_dir, ttt, lora)
+    staged = _staged_ckpt_dir(args.ckpt_dir, ttt)
     # Build everything on the meta device: the real deploy path allocates ~25 GB of
     # CPU shells, which swaps a small machine to a halt. Meta keeps the same
     # construction code and key / shape / strictness logic with no weight memory.
@@ -160,20 +136,14 @@ def main() -> int:
     finally:
         shutil.rmtree(staged, ignore_errors=True)
 
-    added = ("video_ttt.", "lora.")
-    non_ttt_missing = [k for k in report["missing"] if not k.startswith(added)]
+    non_ttt_missing = [k for k in report["missing"] if not k.startswith("video_ttt.")]
     print(f"architecture: {type(arch).__name__}")
-    print(f"missing keys (pretrained): {len(non_ttt_missing)} {non_ttt_missing[:5]}")
-    print(f"missing keys (TTT / LoRA, expected): {len(report['missing']) - len(non_ttt_missing)}")
+    print(f"missing keys (non-TTT): {len(non_ttt_missing)} {non_ttt_missing[:5]}")
+    print(f"missing keys (TTT, expected): {len(report['missing']) - len(non_ttt_missing)}")
     print(f"unexpected keys: {len(report['unexpected'])} {report['unexpected'][:5]}")
     print(f"shape mismatches: {len(report['shape_mismatch'])} {report['shape_mismatch'][:5]}")
     if "ttt_layers" in report:
         print(f"TTT memory: {len(report['ttt_layers'])} layers, {report['ttt_params'] / 1e6:.1f}M params")
-    if "lora_targets" in report:
-        targets = report["lora_targets"]
-        print(
-            f"LoRA: {len(targets)} Linear layers, {report['lora_params'] / 1e6:.1f}M params; e.g. {targets[:2]} … {targets[-1:]}"
-        )
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(f"peak RSS: {peak / (1e9 if sys.platform == 'darwin' else 1e6):.1f} GB")
 
