@@ -147,6 +147,9 @@ ssh -L 6006:localhost:6006 <학습서버>                      # 서버에서 �
 
 ## 5. LoRA 학습 (TTT 대신 DAgger식 업데이트, 1단계)
 
+> **브랜치: `lora`** (main에 머지 안 함). 사내에서는 `git fetch && git checkout lora`.
+> 이 변경은 한 번 main에 들어갔다가 revert(`941058b`, PR #5)로 빠졌음 → 나중에 main에 합칠 땐 `lora`를 그냥 머지하면 LoRA 코드가 안 들어감. 먼저 main에서 `git revert 941058b`(되돌린 걸 다시 되돌리기) 후 `lora` 머지.
+
 TTT 메타학습 대신 성공 trajectory(지금은 libero-plus demo가 proxy)로 **LoRA만** 학습. base는 고정, adapter는 zero-init이라 학습 전엔 릴리즈 모델과 출력이 같음.
 
 | 항목 | 내용 |
