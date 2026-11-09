@@ -30,7 +30,6 @@ from openwam.model.compile_options import (
     self_attn_compile_cfg,
     torch_compile_kwargs,
 )
-from openwam.model.lora import LoRAAdapters, select_lora_targets
 from openwam.model.ttt import VideoTTTMemory, add_ttt_residual
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,6 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         self._mot_driver_kwargs: dict = {}
         self._compiled_mot_run_joint_loop: Optional[Callable[..., Tuple[object, object]]] = None
         self.video_ttt: VideoTTTMemory | None = None
-        self.lora: LoRAAdapters | None = None
         if cfg is None:
             return
         if self.video_backbone is not None:
@@ -91,7 +89,6 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             shift_action=cfg.get("shift_action"),
         )
         self.video_ttt = self._build_video_ttt(cfg, video_dim=video_dim, num_layers=len(bl))
-        self.lora = self._build_lora(cfg)
 
         # MoT driver is built once both backbones are available. The video
         # backbone is normally constructed in ``BaseWAMArchitecture._init_video_backbone``
@@ -154,54 +151,21 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         logger.info("Video TTT memory on layers %s", list(memory.layers))
         return memory
 
-    def _build_lora(self, cfg) -> LoRAAdapters | None:
-        """Attach LoRA adapters from ``cfg.lora`` (None when absent / disabled)."""
-        lora_cfg = self._cfg_get(cfg, "lora", None)
-        if not lora_cfg or not bool(self._cfg_get(lora_cfg, "enabled", False)):
-            return None
-        targets = select_lora_targets(
-            self,
-            experts=self._cfg_get(lora_cfg, "experts", ["action"]),
-            modules=self._cfg_get(lora_cfg, "modules", ["self_attn", "ffn"]),
-        )
-        rank = int(self._cfg_get(lora_cfg, "rank", 16))
-        adapters = LoRAAdapters(
-            self,
-            targets,
-            rank=rank,
-            alpha=float(self._cfg_get(lora_cfg, "alpha", rank)),
-            dropout=float(self._cfg_get(lora_cfg, "dropout", 0.0)),
-        )
-        logger.info("LoRA adapters (rank %d) on %d Linear layers", rank, len(targets))
-        return adapters
-
     def _optional_checkpoint_prefixes(self) -> tuple[str, ...]:
-        # Benchmark-finetuned checkpoints predate the TTT memory and the LoRA adapters;
-        # both start as an exact no-op (zero-initialised output projections).
-        added = (("video_ttt.", self.video_ttt), ("lora.", self.lora))
-        return tuple(prefix for prefix, module in added if module is not None)
-
-    def restrict_training_to(self, prefixes: tuple[str, ...]) -> None:
-        """Make parameters under ``prefixes`` the only trainable ones.
-
-        Unlike ``freeze_modules`` this only flips ``requires_grad``: it must not wrap
-        the backbones in ``no_grad``, because the loss reaches the trainable
-        parameters by back-propagating through the frozen video / action experts.
-        """
-        for name, param in self.named_parameters():
-            param.requires_grad_(name.startswith(prefixes))
+        # Benchmark-finetuned checkpoints predate the TTT memory; it starts zero-initialised.
+        return ("video_ttt.",) if self.video_ttt is not None else ()
 
     def restrict_training_to_ttt(self) -> None:
-        """Make the TTT slow weights the only trainable parameters (TTT meta-training)."""
+        """Make the TTT slow weights the only trainable parameters (TTT meta-training).
+
+        Unlike ``freeze_modules`` this only flips ``requires_grad``: it must not wrap
+        the backbones in ``no_grad``, because the target loss reaches earlier TTT
+        layers by back-propagating through the frozen video / action experts.
+        """
         if self.video_ttt is None:
             raise RuntimeError("restrict_training_to_ttt: ttt is not enabled for this architecture")
-        self.restrict_training_to(("video_ttt.",))
-
-    def restrict_training_to_lora(self) -> None:
-        """Make the LoRA adapters the only trainable parameters (adapter finetuning)."""
-        if self.lora is None:
-            raise RuntimeError("restrict_training_to_lora: lora is not enabled for this architecture")
-        self.restrict_training_to(("lora.",))
+        for name, param in self.named_parameters():
+            param.requires_grad_(name.startswith("video_ttt."))
 
     @property
     def mot_driver(self) -> DualSystemMoTDriver | None:
@@ -211,14 +175,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
     def apply_compile_optimizations(self, compile_cfg) -> None:
         """Compile the eval-time MoT joint loop when requested."""
 
-        self._compiled_mot_run_joint_loop = None
-        if self.lora is not None:
-            # The adapters run as forward hooks inside the compiled regions; stay eager
-            # rather than rely on the compiler tracing them.
-            if compile_enabled(compile_cfg, default=False, strict=True):
-                logger.warning("LoRA adapters are attached: deploy compile disabled, running eager.")
-            return
         super().apply_compile_optimizations(compile_cfg)
+        self._compiled_mot_run_joint_loop = None
         if not compile_enabled(compile_cfg, default=False, strict=True):
             return
 

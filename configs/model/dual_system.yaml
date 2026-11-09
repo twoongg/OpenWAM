@@ -46,14 +46,5 @@ architecture:
     head_dim: 64        # per-head key/value width
     hidden_dim: 128     # SwiGLU fast-weight hidden width
     weight_norm: true   # renormalise fast-weight rows after each write (stable over many writes)
-  # LoRA adapters (joint_self_attn only). enabled → only lora.* trains (base frozen, training.learning_rate);
-  # zero-init, so the model is unchanged until trained. Deploy runs eager while adapters are attached.
-  lora:
-    enabled: false
-    rank: 16
-    alpha: 16           # update scale = alpha / rank
-    dropout: 0.0
-    experts: [action]   # action | video
-    modules: [self_attn, ffn]   # per block: self_attn (q,k,v,o) | cross_attn (q,k,v,o) | ffn
   detach_bridge: false             # joint_cross_attn only
   idm_video_cond_noise_prob: 0.5   # idm only

@@ -68,7 +68,7 @@ class _DeterministicVideoBackbone(_MockVideoBackbone):
         return hs.transpose(1, 2).reshape(B, D, state.grid_frames, state.grid_height, state.grid_width)
 
 
-def _build(ttt_cfg=None, lora_cfg=None):
+def _build(ttt_cfg=None):
     from openwam.model.architectures.dual_system.joint_self_attn import DualSystemSelfAttnArchitecture
 
     class _Arch(DualSystemSelfAttnArchitecture):
@@ -85,8 +85,6 @@ def _build(ttt_cfg=None, lora_cfg=None):
     }
     if ttt_cfg is not None:
         cfg["ttt"] = ttt_cfg
-    if lora_cfg is not None:
-        cfg["lora"] = lora_cfg
     torch.manual_seed(0)
     arch = _Arch(cfg=cfg)
     arch._device = torch.device("cpu")
