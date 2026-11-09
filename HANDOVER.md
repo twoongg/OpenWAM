@@ -143,3 +143,40 @@ ssh -L 6006:localhost:6006 <학습서버>                      # 서버에서 �
 4. 2번에서 WAM 단독 성공도 써넣을지, 쓰기 입력의 noise level·action 포함 여부.
 5. **inner LR** (`training.ttt_meta.inner_lr`, 기본 0.1): WAM-TTT Table B.1 원문 값(meta 0.1 / test 0.01)을 가져왔지만, 그쪽은 inner loss가 video loss + 0.04×KVM이고 우리는 KVM만이라 그대로 대응 안 됨 → 300~500 step 짧은 run으로 0.01 / 0.1 / 1.0 비교, `ttt_context_gain` 제일 잘 오르는 값.
 6. **batch / steps**: OpenWAM Table 10의 RoboDojo SFT는 global batch 256 · 60k step (64 GPU). H100 8장이면 `training.batch_size=16 training.gradient_accumulation_steps=2`(=256), OOM이면 8×4. 60k step은 8장 기준 원래의 ~20배 시간이라 PoC는 2~3k step부터.
+
+---
+
+## 5. FlowDAgger 역계산 측정 (브랜치 `inversion-probe`, main에 안 합침)
+
+질문: **"얼린 체크포인트가 libero-plus demo의 action을 낼 수 있나?"** — 낼 수 있으면 FlowDAgger(모델은 그대로, 시작 노이즈만 골라주는 작은 네트워크 학습)가 통하고, 못 내면 LoRA처럼 가중치를 바꿔야 함. 가중치는 하나도 안 바꿈.
+
+창 하나마다 하는 일 (`openwam/flowdagger/inversion.py`):
+1. 서버와 똑같이 생성 (같은 schedule·seed 42·조건) → `base_mse` = 지금 모델 출력 vs demo
+2. 생성 과정을 step마다 거꾸로 되감아(논문 Eq.3, step당 고정점 반복 `--fp-iters`, 기본 5) demo action이 나오게 하는 시작 노이즈를 찾음. 비디오+action을 같이 되감음 (논문 App. A.2: action만 되감으면 오차가 바닥에서 안 내려감). 목표 비디오는 모델 자신의 생성 결과, action만 demo로 교체 (§4.2).
+3. 찾은 노이즈로 다시 생성 → `recon_mse` = 그 결과 vs demo
+
+```bash
+git fetch && git checkout inversion-probe
+# libero-plus demo (체크포인트 reader 형식 = LeRobot v3 LIBERO, meta/conversion.json 있는 것)
+python scripts/flowdagger/inversion_probe.py --ckpt-dir <OpenWAM-Alpha-Sim-LIBERO> \
+  --dataset-dir <libero_plus_lerobot> --num-samples 64 --label plus --out results/inv_plus.json
+# 비교 기준: 원래 LIBERO 학습 demo로 한 번 더
+python scripts/flowdagger/inversion_probe.py --ckpt-dir <같은 ckpt> \
+  --dataset-dir <libero_lerobot> --num-samples 64 --label libero --out results/inv_libero.json
+```
+
+읽는 법 (값은 모델의 정규화 action 공간, 끝에 표로 출력 + JSON에 창별 기록):
+| 지표 | 뜻 |
+|---|---|
+| `base_mse` | 지금 모델이 demo와 얼마나 다른가 |
+| `seed_best_mse` | 노이즈만 랜덤으로 4번 더 바꿔봤을 때 제일 가까운 것 |
+| `recon_ratio` = recon/base | **≪1 (예: <0.1)이면 도달 가능**, 1 근처면 못 감 |
+| `noise_action_std`, `…frac_abs_gt3` | 찾은 노이즈가 정상 가우시안처럼 생겼나 (std≈1, 0.0027). 도달했어도 노이즈가 이상하게 크면 "억지로" 간 것 |
+| `self_recon_mse` | 모델 자기 출력을 되감았다 다시 생성한 오차 = 이 방법의 바닥 (bf16 포함) |
+| `fp_action_update_last` | 마지막 step 고정점 반복이 수렴했나. 안 줄어들면 `--fp-iters 20`으로 다시 |
+| per active dim | dim 0-2 xyz, 3-8 rot6d, 9 gripper (LIBERO EEF10) |
+
+- 비용(실측 안 함): 창당 forward 약 110~170번 (10 step 기준: 기본 생성 10 + 추가 seed 40 + 되감기 50 + 재생성 10 + self-check 60). H100 한 장에서 돌리는 걸 가정.
+- demo는 체크포인트의 `normalization_stats.npy`로 정규화함 (새 demo로 통계를 다시 만들지 않음). min-max라 범위 밖 값은 [-1,1]로 잘림.
+- reader가 데이터 형식을 거부하면(conversion.json 없음 등) 형식이 다른 것 — 이 경우 말해줄 것.
+- 테스트: `tests/test_flowdagger_*.py` (작은 실제 Wan+ActionDiT, CPU). 생성 루프가 `generate()`와 비트 단위로 같은지, 되감기가 자기 노이즈를 복원하는지, 고정 첫 프레임·비활성 action dim 유지, 스크립트 전체 배선까지.
